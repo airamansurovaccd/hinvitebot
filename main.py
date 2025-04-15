@@ -93,17 +93,14 @@ async def process_users(usernames: list, context: ContextTypes.DEFAULT_TYPE):
         
         await add_user_to_group(username, context)
         
-        # Обновление прогресса каждые 10 пользователей
         if idx % 10 == 0:
             progress = f"Прогресс: {idx}/{session_stats['total']} " \
                      f"(Успешно: {session_stats['success']}, " \
                      f"Ошибки: {session_stats['failed']})"
             await notify_admin(progress)
         
-        # Пауза между добавлениями
         await asyncio.sleep(DELAY)
     
-    # Финальный отчет
     report = (
         "✅ Добавление завершено!\n"
         f"Всего: {session_stats['total']}\n"
@@ -119,7 +116,6 @@ async def start_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if stop_event.is_set():
         stop_event.clear()
     
-    # Используем asyncio.to_thread для синхронных операций с файлами
     usernames = await asyncio.to_thread(load_usernames)
     if not usernames:
         await update.message.reply_text("❌ Файл с юзернеймами пуст или не найден")
@@ -130,7 +126,6 @@ async def start_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Используйте /stop для остановки"
     )
     
-    # Запуск в фоновом режиме
     asyncio.create_task(process_users(usernames, context))
 
 @restricted
@@ -165,8 +160,16 @@ async def add_single(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Не удалось добавить {username}")
 
 # --- Инициализация --- #
+async def on_startup(app: Application):
+    """Выполняется при запуске бота"""
+    await notify_admin("🤖 Бот успешно запущен и готов к работе!")
+
 def main():
-    application = Application.builder().token(TOKEN).build()
+    # Создаем Application с обработчиком запуска
+    application = Application.builder() \
+        .token(TOKEN) \
+        .post_init(on_startup) \
+        .build()
 
     # Регистрация команд
     application.add_handler(CommandHandler("start", start_invite))
@@ -174,11 +177,7 @@ def main():
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CommandHandler("add", add_single))
 
-    # Уведомление о запуске
-    asyncio.create_task(notify_admin("🤖 Бот успешно запущен и готов к работе!"))
-    logger.info("Бот запущен")
-
-    # Запуск бота
+    logger.info("Запуск бота...")
     application.run_polling()
 
 if __name__ == '__main__':
