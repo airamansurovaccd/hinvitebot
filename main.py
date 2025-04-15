@@ -1,10 +1,10 @@
 import os
 import csv
-import time
+import asyncio
 import logging
 from threading import Event
 from dotenv import load_dotenv
-from telegram import Update, Bot
+from telegram import Bot, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -35,6 +35,7 @@ session_stats = {'success': 0, 'failed': 0, 'total': 0}
 
 # --- Утилиты --- #
 def restricted(func):
+    """Декоратор для ограничения доступа только админам"""
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         if update.effective_user.id not in ADMIN_IDS:
             await context.bot.send_message(
@@ -46,19 +47,33 @@ def restricted(func):
     return wrapped
 
 async def notify_admin(message: str):
+    """Отправка уведомления админам"""
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(chat_id=admin_id, text=message)
         except Exception as e:
             logger.error(f"Ошибка уведомления админа {admin_id}: {e}")
 
+def load_usernames(filename: str = CSV_FILE):
+    """Загрузка юзернеймов из CSV (синхронная)"""
+    try:
+        with open(filename, mode='r', encoding='utf-8') as file:
+            return [row[0].strip() for row in csv.reader(file) if row]
+    except Exception as e:
+        logger.error(f"Ошибка загрузки файла: {e}")
+        return []
+
 # --- Основные функции --- #
 async def add_user_to_group(username: str, context: ContextTypes.DEFAULT_TYPE):
+    """Добавление одного пользователя"""
     if not username.startswith('@'):
         username = f'@{username}'
     
     try:
-        await context.bot.add_chat_member(chat_id=GROUP_ID, user_id=username)
+        await context.bot.add_chat_member(
+            chat_id=GROUP_ID,
+            user_id=username
+        )
         session_stats['success'] += 1
         logger.info(f"Успешно добавлен {username}")
         return True
@@ -68,6 +83,7 @@ async def add_user_to_group(username: str, context: ContextTypes.DEFAULT_TYPE):
         return False
 
 async def process_users(usernames: list, context: ContextTypes.DEFAULT_TYPE):
+    """Основной процесс добавления"""
     session_stats['total'] = len(usernames)
     
     for idx, username in enumerate(usernames, 1):
@@ -77,12 +93,17 @@ async def process_users(usernames: list, context: ContextTypes.DEFAULT_TYPE):
         
         await add_user_to_group(username, context)
         
+        # Обновление прогресса каждые 10 пользователей
         if idx % 10 == 0:
-            progress = f"Прогресс: {idx}/{session_stats['total']} (Успешно: {session_stats['success']}, Ошибки: {session_stats['failed']})"
+            progress = f"Прогресс: {idx}/{session_stats['total']} " \
+                     f"(Успешно: {session_stats['success']}, " \
+                     f"Ошибки: {session_stats['failed']})"
             await notify_admin(progress)
         
-        time.sleep(DELAY)
+        # Пауза между добавлениями
+        await asyncio.sleep(DELAY)
     
+    # Финальный отчет
     report = (
         "✅ Добавление завершено!\n"
         f"Всего: {session_stats['total']}\n"
@@ -94,7 +115,12 @@ async def process_users(usernames: list, context: ContextTypes.DEFAULT_TYPE):
 # --- Команды бота --- #
 @restricted
 async def start_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    usernames = load_usernames()
+    """Запуск процесса добавления"""
+    if stop_event.is_set():
+        stop_event.clear()
+    
+    # Используем asyncio.to_thread для синхронных операций с файлами
+    usernames = await asyncio.to_thread(load_usernames)
     if not usernames:
         await update.message.reply_text("❌ Файл с юзернеймами пуст или не найден")
         return
@@ -104,18 +130,55 @@ async def start_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Используйте /stop для остановки"
     )
     
-    context.job_queue.run_once(
-        lambda ctx: process_users(usernames, ctx),
-        when=0
-    )
+    # Запуск в фоновом режиме
+    asyncio.create_task(process_users(usernames, context))
 
-# --- Запуск --- #
+@restricted
+async def stop_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Экстренная остановка"""
+    stop_event.set()
+    await update.message.reply_text("🛑 Процесс добавления будет остановлен!")
+
+@restricted
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика добавления"""
+    stats_text = (
+        "📊 Текущая статистика:\n"
+        f"Всего: {session_stats['total']}\n"
+        f"Успешно: {session_stats['success']}\n"
+        f"Ошибки: {session_stats['failed']}\n"
+        f"Осталось: {session_stats['total'] - session_stats['success'] - session_stats['failed']}"
+    )
+    await update.message.reply_text(stats_text)
+
+@restricted
+async def add_single(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Добавление одного пользователя по команде"""
+    if not context.args:
+        await update.message.reply_text("Использование: /add @username")
+        return
+    
+    username = context.args[0]
+    if await add_user_to_group(username, context):
+        await update.message.reply_text(f"✅ {username} успешно добавлен")
+    else:
+        await update.message.reply_text(f"❌ Не удалось добавить {username}")
+
+# --- Инициализация --- #
 def main():
     application = Application.builder().token(TOKEN).build()
-    
+
+    # Регистрация команд
     application.add_handler(CommandHandler("start", start_invite))
-    # ... остальные обработчики
-    
+    application.add_handler(CommandHandler("stop", stop_invite))
+    application.add_handler(CommandHandler("stats", stats))
+    application.add_handler(CommandHandler("add", add_single))
+
+    # Уведомление о запуске
+    asyncio.create_task(notify_admin("🤖 Бот успешно запущен и готов к работе!"))
+    logger.info("Бот запущен")
+
+    # Запуск бота
     application.run_polling()
 
 if __name__ == '__main__':
