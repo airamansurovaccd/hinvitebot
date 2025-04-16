@@ -4,13 +4,19 @@ import asyncio
 import logging
 from threading import Event
 from dotenv import load_dotenv
-from telegram import Bot, Update
+from telegram import (
+    Bot,
+    Update,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove
+)
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
-    filters,
     ContextTypes,
+    MessageHandler,
+    filters
 )
 
 # --- Конфигурация --- #
@@ -19,7 +25,7 @@ TOKEN = os.getenv('BOT_TOKEN')
 GROUP_ID = int(os.getenv('GROUP_ID'))
 ADMIN_IDS = [int(id) for id in os.getenv('ADMIN_IDS').split(',')]
 CSV_FILE = os.getenv('CSV_FILE', 'username.csv')
-DELAY = int(os.getenv('DELAY_SECONDS', 7))
+DELAY = int(os.getenv('DELAY_SECONDS', 5))
 
 # Настройка логирования
 logging.basicConfig(
@@ -29,35 +35,53 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Глобальные переменные
-bot = Bot(token=TOKEN)
 stop_event = Event()
 session_stats = {'success': 0, 'failed': 0, 'total': 0}
 
+# --- Клавиатуры --- #
+def get_main_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("▶️ Начать добавление")],
+            [KeyboardButton("⏹ Остановить"), KeyboardButton("📊 Статистика")],
+            [KeyboardButton("➕ Добавить пользователя")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False
+    )
+
+def get_cancel_keyboard():
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("❌ Отмена")]],
+        resize_keyboard=True
+    )
+
 # --- Утилиты --- #
 def restricted(func):
-    """Декоратор для ограничения доступа только админам"""
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         if update.effective_user.id not in ADMIN_IDS:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="🚫 Доступ запрещен: нужны права администратора"
+            await update.message.reply_text(
+                "🚫 Доступ запрещен: нужны права администратора",
+                reply_markup=ReplyKeyboardRemove()
             )
             return
         return await func(update, context, *args, **kwargs)
     return wrapped
 
-async def notify_admin(message: str):
-    """Отправка уведомления админам"""
+async def notify_admin(context: ContextTypes.DEFAULT_TYPE, message: str):
     for admin_id in ADMIN_IDS:
         try:
-            await bot.send_message(chat_id=admin_id, text=message)
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=message,
+                reply_markup=get_main_keyboard()
+            )
         except Exception as e:
             logger.error(f"Ошибка уведомления админа {admin_id}: {e}")
 
-def load_usernames(filename: str = CSV_FILE):
-    """Загрузка юзернеймов из CSV (синхронная)"""
+def load_usernames():
     try:
-        with open(filename, mode='r', encoding='utf-8') as file:
+        with open(CSV_FILE, mode='r', encoding='utf-8') as file:
             return [row[0].strip() for row in csv.reader(file) if row]
     except Exception as e:
         logger.error(f"Ошибка загрузки файла: {e}")
@@ -65,14 +89,14 @@ def load_usernames(filename: str = CSV_FILE):
 
 # --- Основные функции --- #
 async def add_user_to_group(username: str, context: ContextTypes.DEFAULT_TYPE):
-    """Добавление одного пользователя"""
     if not username.startswith('@'):
         username = f'@{username}'
     
     try:
+        user = await context.bot.get_chat(username)
         await context.bot.add_chat_member(
             chat_id=GROUP_ID,
-            user_id=username
+            user_id=user.id
         )
         session_stats['success'] += 1
         logger.info(f"Успешно добавлен {username}")
@@ -82,103 +106,132 @@ async def add_user_to_group(username: str, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"Ошибка с {username}: {str(e)}")
         return False
 
-async def process_users(usernames: list, context: ContextTypes.DEFAULT_TYPE):
-    """Основной процесс добавления"""
+async def process_users(context: ContextTypes.DEFAULT_TYPE):
+    usernames = load_usernames()
+    if not usernames:
+        await notify_admin(context, "❌ Файл с юзернеймами пуст или не найден")
+        return
+    
     session_stats['total'] = len(usernames)
     
     for idx, username in enumerate(usernames, 1):
         if stop_event.is_set():
             logger.info("Процесс остановлен администратором")
+            await notify_admin(context, "⏹ Добавление остановлено")
             return
         
         await add_user_to_group(username, context)
         
         if idx % 10 == 0:
-            progress = f"Прогресс: {idx}/{session_stats['total']} " \
-                     f"(Успешно: {session_stats['success']}, " \
-                     f"Ошибки: {session_stats['failed']})"
-            await notify_admin(progress)
+            progress = (
+                f"Прогресс: {idx}/{session_stats['total']}\n"
+                f"✅ Успешно: {session_stats['success']}\n"
+                f"❌ Ошибки: {session_stats['failed']}"
+            )
+            await notify_admin(context, progress)
         
         await asyncio.sleep(DELAY)
     
     report = (
-        "✅ Добавление завершено!\n"
+        "🎉 Добавление завершено!\n"
         f"Всего: {session_stats['total']}\n"
         f"Успешно: {session_stats['success']}\n"
         f"Ошибки: {session_stats['failed']}"
     )
-    await notify_admin(report)
+    await notify_admin(context, report)
 
-# --- Команды бота --- #
+# --- Обработчики сообщений --- #
 @restricted
-async def start_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запуск процесса добавления"""
-    if stop_event.is_set():
-        stop_event.clear()
-    
-    usernames = await asyncio.to_thread(load_usernames)
-    if not usernames:
-        await update.message.reply_text("❌ Файл с юзернеймами пуст или не найден")
-        return
-    
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"🚀 Начинаю добавление {len(usernames)} пользователей...\n"
-        f"Используйте /stop для остановки"
+        "🤖 Бот готов к работе!",
+        reply_markup=get_main_keyboard()
     )
+
+@restricted
+async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
     
-    asyncio.create_task(process_users(usernames, context))
-
-@restricted
-async def stop_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Экстренная остановка"""
-    stop_event.set()
-    await update.message.reply_text("🛑 Процесс добавления будет остановлен!")
-
-@restricted
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Статистика добавления"""
-    stats_text = (
-        "📊 Текущая статистика:\n"
-        f"Всего: {session_stats['total']}\n"
-        f"Успешно: {session_stats['success']}\n"
-        f"Ошибки: {session_stats['failed']}\n"
-        f"Осталось: {session_stats['total'] - session_stats['success'] - session_stats['failed']}"
-    )
-    await update.message.reply_text(stats_text)
-
-@restricted
-async def add_single(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Добавление одного пользователя по команде"""
-    if not context.args:
-        await update.message.reply_text("Использование: /add @username")
-        return
+    if text == "▶️ Начать добавление":
+        if stop_event.is_set():
+            stop_event.clear()
+        
+        await update.message.reply_text(
+            "🔍 Загружаю список пользователей...",
+            reply_markup=get_main_keyboard()
+        )
+        asyncio.create_task(process_users(context))
     
-    username = context.args[0]
-    if await add_user_to_group(username, context):
-        await update.message.reply_text(f"✅ {username} успешно добавлен")
-    else:
-        await update.message.reply_text(f"❌ Не удалось добавить {username}")
+    elif text == "⏹ Остановить":
+        stop_event.set()
+        await update.message.reply_text(
+            "🛑 Процесс добавления будет остановлен!",
+            reply_markup=get_main_keyboard()
+        )
+    
+    elif text == "📊 Статистика":
+        stats_text = (
+            "📊 Текущая статистика:\n"
+            f"• Всего: {session_stats['total']}\n"
+            f"• Успешно: {session_stats['success']}\n"
+            f"• Ошибки: {session_stats['failed']}\n"
+            f"• Осталось: {session_stats['total'] - session_stats['success'] - session_stats['failed']}"
+        )
+        await update.message.reply_text(
+            stats_text,
+            reply_markup=get_main_keyboard()
+        )
+    
+    elif text == "➕ Добавить пользователя":
+        await update.message.reply_text(
+            "Введите @username пользователя:",
+            reply_markup=get_cancel_keyboard()
+        )
+        context.user_data['awaiting_username'] = True
+    
+    elif text == "❌ Отмена":
+        await update.message.reply_text(
+            "Действие отменено",
+            reply_markup=get_main_keyboard()
+        )
+        context.user_data.pop('awaiting_username', None)
+    
+    elif context.user_data.get('awaiting_username'):
+        username = text.strip()
+        if await add_user_to_group(username, context):
+            await update.message.reply_text(
+                f"✅ {username} успешно добавлен",
+                reply_markup=get_main_keyboard()
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ Не удалось добавить {username}",
+                reply_markup=get_main_keyboard()
+            )
+        context.user_data.pop('awaiting_username', None)
 
 # --- Инициализация --- #
-async def on_startup(app: Application):
-    """Выполняется при запуске бота"""
-    await notify_admin("🤖 Бот успешно запущен и готов к работе!")
+async def post_init(application: Application):
+    await application.bot.send_message(
+        chat_id=ADMIN_IDS[0],
+        text="🤖 Бот успешно запущен!",
+        reply_markup=get_main_keyboard()
+    )
 
 def main():
-    # Создаем Application с обработчиком запуска
     application = Application.builder() \
         .token(TOKEN) \
-        .post_init(on_startup) \
+        .post_init(post_init) \
         .build()
 
-    # Регистрация команд
-    application.add_handler(CommandHandler("start", start_invite))
-    application.add_handler(CommandHandler("stop", stop_invite))
-    application.add_handler(CommandHandler("stats", stats))
-    application.add_handler(CommandHandler("add", add_single))
+    # Регистрация обработчиков
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messages))
 
-    logger.info("Запуск бота...")
-    application.run_polling()
+    application.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES
+    )
 
 if __name__ == '__main__':
     main()
